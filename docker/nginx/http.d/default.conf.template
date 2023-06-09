@@ -1,0 +1,98 @@
+proxy_cache_path /var/cache/nginx/static levels=1:2 keys_zone=static:10m max_size=1g inactive=30m;
+
+map $arg_size $image_resize_width {
+    default -;
+    thumb   240;
+    small   400;
+    medium  800;
+    large   1200;
+}
+
+server {
+    listen 80 default_server;
+
+    root /usr/share/nginx/html;
+
+    location / {
+        empty_gif;
+    }
+
+    location /files/ {
+        expires               max;
+
+        proxy_cache           static;
+        proxy_cache_valid     200 7d;
+
+        add_header            X-Cache-Status $upstream_cache_status;
+
+        proxy_set_header      Host $host;
+        proxy_pass            http://127.0.0.1:8001;
+    }
+}
+
+server {
+    listen 8001;
+
+    location ~ ^/files/(?<file_path>.+\.(gif|png|webp|jpe?g))$ {
+        image_filter resize $image_resize_width -;
+        image_filter_jpeg_quality 90;
+        image_filter_buffer 10M;
+
+        proxy_intercept_errors on;
+        error_page 403 404 405 415 = @notfound;
+
+        rewrite .* /files/$file_path break;
+
+        proxy_set_header       Host $host;
+        proxy_pass             http://127.0.0.1:8002;
+    }
+
+    location ~ ^/files/(?<file_path>.+)$ {
+        proxy_intercept_errors on;
+        error_page 403 404 405 = @notfound;
+
+        rewrite .* /files/$file_path break;
+
+        proxy_set_header       Host $host;
+        proxy_pass             http://127.0.0.1:8002;
+    }
+
+    location @notfound {
+        return 404;
+    }
+}
+
+server {
+    listen 8002;
+
+    location ~* ^/files/(?<file_path>.+) {
+        proxy_cache            static;
+        proxy_cache_valid      200 24h;
+        proxy_hide_header      x-amz-id-2;
+        proxy_hide_header      x-amz-request-id;
+        proxy_hide_header      Set-Cookie;
+        proxy_ignore_headers   Set-Cookie;
+
+        set $bucket            ${API_BUCKET};
+        set $aws_access        ${API_ACCESS_KEY};
+        set $aws_secret        ${API_ACCESS_SECRET};
+        set_formatted_gmt_time $now "%Y%m%dT%H%M%SZ";
+        set $string_to_sign    "GET\n\n\n\nx-amz-date:${now}\n/$bucket/public/$file_path";
+        set_hmac_sha1          $aws_signature $aws_secret $string_to_sign;
+        set_encode_base64      $aws_signature $aws_signature;
+
+        proxy_http_version     1.1;
+        proxy_set_header       x-amz-date $now;
+        proxy_set_header       Authorization "AWS $aws_access:$aws_signature";
+        proxy_intercept_errors on;
+        error_page 403 404 405 = @notfound;
+        # add_header             X-Cache-Status $upstream_cache_status;
+
+        rewrite .* /$bucket/public/$file_path break;
+        proxy_pass             ${API_URL};
+    }
+
+    location @notfound {
+        return 404;
+    }
+}
